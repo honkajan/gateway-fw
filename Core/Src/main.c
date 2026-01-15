@@ -32,6 +32,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define FW_ID_STRING "STM32F103C8 UART ping-pong demo"
 
 /* USER CODE END PD */
 
@@ -44,7 +45,9 @@
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-
+uint8_t ch;
+static char line[64];
+static size_t line_len = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -105,9 +108,7 @@ int main(void)
   {
     /* USER CODE END WHILE */
 
-	  uint8_t ch;
-	  static char line[64];
-	  static size_t line_len = 0;
+
 
 	  if (HAL_UART_Receive(&huart1, &ch, 1, 10) == HAL_OK)
 	  {
@@ -122,8 +123,13 @@ int main(void)
 	      if (strcmp(line, "PING") == 0)
 	      {
 	        uart_send_str(&huart1, "PONG\n");
+
 	        // Optional LED blink (PC13 active-low)
-	        // HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+	        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+	      }
+	      else if (strcmp(line, "ID?") == 0)
+	      {
+	        uart_send_str(&huart1, FW_ID_STRING "\n");
 	      }
 	      else
 	      {
