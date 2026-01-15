@@ -1,0 +1,16 @@
+# --- Build outputs (CubeIDE / GCC) ---
+Debug/
+Release/
+
+# --- Debug launch configs (IDE-generated, not needed) ---
+*.launch
+
+# --- Eclipse / STM32CubeIDE workspace metadata (usually safe to ignore) ---
+.metadata/
+.settings/
+
+# --- Misc OS/editor files ---
+.DS_Store
+*.swp
+*.swo
+*~
