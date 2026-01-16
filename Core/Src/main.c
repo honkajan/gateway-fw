@@ -32,7 +32,15 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define FW_ID_STRING "STM32F103C8 UART ping-pong demo"
+#define FW_VERSION_MAJOR 0
+#define FW_VERSION_MINOR 2
+#define FW_VERSION_PATCH 0
+
+#define FW_VERSION_STR  "v0.2.0"
+
+#define FW_ID_STRING "STM32F103C8 UART ping-pong demo " FW_VERSION_STR
+
+
 
 /* USER CODE END PD */
 
