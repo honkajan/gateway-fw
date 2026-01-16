@@ -21,6 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 #include <string.h>
 
 /* USER CODE END Includes */
@@ -72,6 +73,19 @@ static void uart_send_str(UART_HandleTypeDef *huart, const char *s)
 {
   HAL_UART_Transmit(huart, (uint8_t *)s, (uint16_t)strlen(s), 100);
 }
+
+static void uart_send_version(UART_HandleTypeDef *huart)
+{
+  char buf[16];
+  int n = snprintf(buf, sizeof(buf), "%d.%d.%d\n",
+                   FW_VERSION_MAJOR, FW_VERSION_MINOR, FW_VERSION_PATCH);
+  if (n > 0) {
+    uart_send_str(huart, buf);
+  } else {
+    uart_send_str(huart, "ERR\n");
+  }
+}
+
 
 /* USER CODE END 0 */
 
@@ -138,6 +152,10 @@ int main(void)
 	      else if (strcmp(line, "ID?") == 0)
 	      {
 	        uart_send_str(&huart1, FW_ID_STRING "\n");
+	      }
+	      else if (strcmp(line, "VER?") == 0)
+	      {
+	        uart_send_version(&huart1);
 	      }
 	      else
 	      {
