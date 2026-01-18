@@ -86,6 +86,19 @@ static void uart_send_version(UART_HandleTypeDef *huart)
   }
 }
 
+static void uart_send_uptime(UART_HandleTypeDef *huart)
+{
+  uint32_t ms = HAL_GetTick();  // milliseconds since boot
+  char buf[16];
+  int n = snprintf(buf, sizeof(buf), "%lu\n", (unsigned long)ms);
+  if (n > 0) {
+    uart_send_str(huart, buf);
+  } else {
+    uart_send_str(huart, "ERR\n");
+  }
+}
+
+
 
 /* USER CODE END 0 */
 
@@ -157,6 +170,11 @@ int main(void)
 	      {
 	        uart_send_version(&huart1);
 	      }
+	      else if (strcmp(line, "UPTIME?") == 0)
+	      {
+	        uart_send_uptime(&huart1);
+	      }
+
 	      else
 	      {
 	        uart_send_str(&huart1, "ERR\n");
