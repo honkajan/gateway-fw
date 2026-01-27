@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include <stdarg.h>
 
 /* USER CODE END Includes */
 
@@ -41,6 +42,44 @@
 
 #define FW_ID_STRING "STM32F103C8 UART ping-pong demo " FW_VERSION_STR
 
+// Pins
+#define NRF_CE_PORT   GPIOB
+#define NRF_CE_PIN    GPIO_PIN_0
+#define NRF_CSN_PORT  GPIOB
+#define NRF_CSN_PIN   GPIO_PIN_1
+
+static inline void nrf_ce(int on)
+{
+  HAL_GPIO_WritePin(NRF_CE_PORT, NRF_CE_PIN, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static inline void nrf_csn(int on)
+{
+  HAL_GPIO_WritePin(NRF_CSN_PORT, NRF_CSN_PIN, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+// Commands + regs
+#define NRF_CMD_R_REGISTER     0x00
+#define NRF_CMD_W_REGISTER     0x20
+#define NRF_CMD_R_RX_PAYLOAD   0x61
+#define NRF_CMD_W_TX_PAYLOAD   0xA0
+#define NRF_CMD_FLUSH_TX       0xE1
+#define NRF_CMD_FLUSH_RX       0xE2
+#define NRF_CMD_NOP            0xFF
+
+#define NRF_REG_CONFIG         0x00
+#define NRF_REG_EN_AA          0x01
+#define NRF_REG_EN_RXADDR      0x02
+#define NRF_REG_SETUP_RETR     0x04
+#define NRF_REG_RF_CH          0x05
+#define NRF_REG_RF_SETUP       0x06
+#define NRF_REG_STATUS         0x07
+#define NRF_REG_RX_ADDR_P0     0x0A
+#define NRF_REG_TX_ADDR        0x10
+#define NRF_REG_RX_PW_P0       0x11
+#define NRF_REG_FIFO_STATUS    0x17
+
+
 
 
 /* USER CODE END PD */
@@ -51,6 +90,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+SPI_HandleTypeDef hspi1;
+
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
@@ -63,6 +104,7 @@ static size_t line_len = 0;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -99,6 +141,215 @@ static void uart_send_uptime(UART_HandleTypeDef *huart)
 }
 
 
+static void uart_printf(const char *fmt, ...)
+{
+  char buf[128];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+
+  if (n < 0) return;
+  if (n > (int)sizeof(buf)) n = sizeof(buf);
+
+  HAL_UART_Transmit(&huart1, (uint8_t*)buf, (uint16_t)strlen(buf), HAL_MAX_DELAY);
+}
+
+// SPI xfer
+static uint8_t nrf_spi_xfer(uint8_t b)
+{
+  uint8_t rx = 0;
+  HAL_SPI_TransmitReceive(&hspi1, &b, &rx, 1, HAL_MAX_DELAY);
+  return rx;
+}
+
+// Register IO
+static uint8_t nrf_get_status_cmd(void)
+{
+  uint8_t st;
+  nrf_csn(0);
+  st = nrf_spi_xfer(NRF_CMD_NOP);
+  nrf_csn(1);
+  return st;
+}
+
+static uint8_t nrf_read_reg(uint8_t reg)
+{
+  uint8_t v;
+  nrf_csn(0);
+  nrf_spi_xfer(NRF_CMD_R_REGISTER | (reg & 0x1F));
+  v = nrf_spi_xfer(NRF_CMD_NOP);
+  nrf_csn(1);
+  return v;
+}
+
+static void nrf_write_reg(uint8_t reg, uint8_t v)
+{
+  nrf_csn(0);
+  nrf_spi_xfer(NRF_CMD_W_REGISTER | (reg & 0x1F));
+  nrf_spi_xfer(v);
+  nrf_csn(1);
+}
+
+static void nrf_write_reg_buf(uint8_t reg, const uint8_t *buf, uint8_t len)
+{
+  nrf_csn(0);
+  nrf_spi_xfer(NRF_CMD_W_REGISTER | (reg & 0x1F));
+  for (uint8_t i = 0; i < len; i++) nrf_spi_xfer(buf[i]);
+  nrf_csn(1);
+}
+
+// FIFO flush + IRQ clear
+static void nrf_flush_rx(void)
+{
+  nrf_csn(0); nrf_spi_xfer(NRF_CMD_FLUSH_RX); nrf_csn(1);
+}
+
+static void nrf_flush_tx(void)
+{
+  nrf_csn(0); nrf_spi_xfer(NRF_CMD_FLUSH_TX); nrf_csn(1);
+}
+
+static void nrf_clear_irqs(void)
+{
+  // Clear RX_DR(6), TX_DS(5), MAX_RT(4)
+  nrf_write_reg(NRF_REG_STATUS, 0x70);
+}
+
+// Payload IO
+static int nrf_rx_available(void)
+{
+  uint8_t fifo = nrf_read_reg(NRF_REG_FIFO_STATUS);
+  return ((fifo & 0x01u) == 0u); // RX_EMPTY bit0 == 0 => data available
+}
+
+static void nrf_read_payload32(uint8_t *p32)
+{
+  nrf_csn(0);
+  nrf_spi_xfer(NRF_CMD_R_RX_PAYLOAD);
+  for (int i = 0; i < 32; i++) p32[i] = nrf_spi_xfer(NRF_CMD_NOP);
+  nrf_csn(1);
+}
+
+static void nrf_write_payload32(const uint8_t *p32)
+{
+  nrf_csn(0);
+  nrf_spi_xfer(NRF_CMD_W_TX_PAYLOAD);
+  for (int i = 0; i < 32; i++) nrf_spi_xfer(p32[i]);
+  nrf_csn(1);
+}
+
+
+// Mode switching
+static void nrf_set_rx_mode(void)
+{
+  nrf_ce(0);
+  nrf_write_reg(NRF_REG_CONFIG, 0x0F); // PWR_UP=1, PRIM_RX=1, CRC enabled
+  HAL_Delay(2);
+  nrf_ce(1);
+}
+
+static void nrf_set_tx_mode(void)
+{
+  nrf_ce(0);
+  nrf_write_reg(NRF_REG_CONFIG, 0x0E); // PWR_UP=1, PRIM_RX=0, CRC enabled
+  HAL_Delay(2);
+}
+
+
+// Common link init (call on both nodes)
+static void nrf_init_link_common(void)
+{
+  static const uint8_t addr[5] = {0xE7,0xE7,0xE7,0xE7,0xE7};
+
+  // Electrical idle + settle
+  nrf_ce(0);
+  nrf_csn(1);
+  HAL_Delay(10);
+
+  // Your “sync kick” (good!)
+  nrf_flush_rx();
+  nrf_flush_tx();
+  nrf_clear_irqs();
+
+  // Channel
+  nrf_write_reg(NRF_REG_RF_CH, 76);
+
+  // Auto-ack on pipe0
+  nrf_write_reg(NRF_REG_EN_AA, 0x01);
+  // Enable pipe0
+  nrf_write_reg(NRF_REG_EN_RXADDR, 0x01);
+
+  // Retries: ARD=4 (1500us), ARC=15
+  nrf_write_reg(NRF_REG_SETUP_RETR, 0x4F);
+
+  // RF_SETUP: 1Mbps, max power (bits differ by module; this is common baseline)
+  // For plain nRF24L01+: 0x06 = 1Mbps, 0dBm. We’ll start with 0x06 since you already use it.
+  nrf_write_reg(NRF_REG_RF_SETUP, 0x06);
+
+  // Addresses for pipe0 and TX (must match for auto-ack)
+  nrf_write_reg_buf(NRF_REG_RX_ADDR_P0, addr, 5);
+  nrf_write_reg_buf(NRF_REG_TX_ADDR, addr, 5);
+
+  // Fixed payload size
+  nrf_write_reg(NRF_REG_RX_PW_P0, 32);
+
+  nrf_flush_rx();
+  nrf_flush_tx();
+  nrf_clear_irqs();
+
+  // Start in RX mode
+  nrf_set_rx_mode();
+}
+
+// Living-room node logic: send “PING” once per second and wait for “PONG”
+static int gateway_send_ping_wait_pong(void)
+{
+  uint8_t tx[32] = {0};
+  tx[0]='P'; tx[1]='I'; tx[2]='N'; tx[3]='G';
+
+  // TX
+  nrf_set_tx_mode();
+  nrf_clear_irqs();
+  nrf_flush_tx();
+  nrf_write_payload32(tx);
+
+  nrf_ce(1);
+  HAL_Delay(1);
+  nrf_ce(0);
+
+  // Wait TX done or max retries
+  uint32_t start = HAL_GetTick();
+  while ((HAL_GetTick() - start) < 100) {
+    uint8_t st = nrf_get_status_cmd();
+    if (st & (1u<<5)) { // TX_DS
+      nrf_clear_irqs();
+      break;
+    }
+    if (st & (1u<<4)) { // MAX_RT
+      nrf_clear_irqs();
+      nrf_flush_tx();
+      nrf_set_rx_mode();
+      return -1;
+    }
+  }
+
+  // Switch to RX and wait for response
+  nrf_set_rx_mode();
+  start = HAL_GetTick();
+  while ((HAL_GetTick() - start) < 200) {
+    if (nrf_rx_available()) {
+      uint8_t rx[32];
+      nrf_read_payload32(rx);
+      nrf_clear_irqs();
+      if (rx[0]=='P' && rx[1]=='O' && rx[2]=='N' && rx[3]=='G') {
+        return 0;
+      }
+    }
+  }
+  return -2;
+}
+
 
 /* USER CODE END 0 */
 
@@ -132,8 +383,14 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
-  uart_send_str(&huart1, "READY\n");
+
+  nrf_init_link_common();
+  uart_printf("Gateway NRF STATUS=0x%02X\r\n", nrf_get_status_cmd());
+
+
+//  uart_send_str(&huart1, "READY\n");
 
   /* USER CODE END 2 */
 
@@ -141,60 +398,13 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	  int rc = gateway_send_ping_wait_pong();
+	  if (rc == 0) uart_printf("PONG OK\r\n");
+	  else if (rc == -1) uart_printf("PING FAIL: MAX_RT\r\n");
+	  else uart_printf("PING FAIL: TIMEOUT\r\n");
+
+	  HAL_Delay(1000);
     /* USER CODE END WHILE */
-
-
-
-	  if (HAL_UART_Receive(&huart1, &ch, 1, 10) == HAL_OK)
-	  {
-	    if (ch == '\r')
-	    {
-	      // ignore CR
-	    }
-	    else if (ch == '\n')
-	    {
-	      line[line_len] = '\0';
-
-	      if (strcmp(line, "PING") == 0)
-	      {
-	        uart_send_str(&huart1, "PONG\n");
-
-	        // Optional LED blink (PC13 active-low)
-	        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-	      }
-	      else if (strcmp(line, "ID?") == 0)
-	      {
-	        uart_send_str(&huart1, FW_ID_STRING "\n");
-	      }
-	      else if (strcmp(line, "VER?") == 0)
-	      {
-	        uart_send_version(&huart1);
-	      }
-	      else if (strcmp(line, "UPTIME?") == 0)
-	      {
-	        uart_send_uptime(&huart1);
-	      }
-
-	      else
-	      {
-	        uart_send_str(&huart1, "ERR\n");
-	      }
-
-	      line_len = 0;
-	    }
-	    else
-	    {
-	      if (line_len < (sizeof(line) - 1))
-	      {
-	        line[line_len++] = (char)ch;
-	      }
-	      else
-	      {
-	        line_len = 0;
-	        uart_send_str(&huart1, "ERR\n");
-	      }
-	    }
-	  }
 
     /* USER CODE BEGIN 3 */
   }
@@ -237,6 +447,44 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
 }
 
 /**
@@ -287,9 +535,16 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
@@ -297,6 +552,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB0 PB1 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
