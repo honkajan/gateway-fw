@@ -74,6 +74,8 @@ static inline void nrf_csn(int on)
 #define NRF_REG_RF_CH          0x05
 #define NRF_REG_RF_SETUP       0x06
 #define NRF_REG_STATUS         0x07
+#define NRF_REG_OBSERVE_TX     0x08
+#define NRF_REG_RPD            0x09
 #define NRF_REG_RX_ADDR_P0     0x0A
 #define NRF_REG_TX_ADDR        0x10
 #define NRF_REG_RX_PW_P0       0x11
@@ -350,6 +352,38 @@ static int gateway_send_ping_wait_pong(void)
   return -2;
 }
 
+static void nrf_print_rf_setup(void)
+{
+  uint8_t rf = nrf_read_reg(NRF_REG_RF_SETUP);
+
+  const char *rate = "1Mbps";
+  if (rf & (1u << 5)) rate = "250kbps";
+  else if (rf & (1u << 3)) rate = "2Mbps";
+
+  uint8_t pwr = (rf >> 1) & 0x03;
+  const char *pwr_s = "?";
+  switch (pwr) {
+    case 0: pwr_s = "-18dBm"; break;
+    case 1: pwr_s = "-12dBm"; break;
+    case 2: pwr_s = "-6dBm";  break;
+    case 3: pwr_s = "0dBm";   break;
+  }
+
+  uint8_t retr = nrf_read_reg(NRF_REG_SETUP_RETR);
+  uint8_t ard = (retr >> 4) & 0x0F;
+  uint8_t arc = retr & 0x0F;
+
+  uart_printf(
+    "NRF: ch=%u rate=%s txpwr=%s retr=%uus x%u\r\n",
+    nrf_read_reg(NRF_REG_RF_CH),
+    rate,
+    pwr_s,
+    (ard + 1) * 250,
+    arc
+  );
+}
+
+
 
 /* USER CODE END 0 */
 
@@ -387,6 +421,7 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   nrf_init_link_common();
+  nrf_print_rf_setup();
   uart_printf("Gateway NRF STATUS=0x%02X\r\n", nrf_get_status_cmd());
 
 
@@ -399,9 +434,20 @@ int main(void)
   while (1)
   {
 	  int rc = gateway_send_ping_wait_pong();
-	  if (rc == 0) uart_printf("PONG OK\r\n");
-	  else if (rc == -1) uart_printf("PING FAIL: MAX_RT\r\n");
-	  else uart_printf("PING FAIL: TIMEOUT\r\n");
+
+	  uint8_t obs = nrf_read_reg(NRF_REG_OBSERVE_TX);
+	  uint8_t arc_cnt  = obs & 0x0F;
+	  uint8_t plos_cnt = (obs >> 4) & 0x0F;
+	  uint8_t rpd = nrf_read_reg(NRF_REG_RPD);
+
+	  if (rc == 0) {
+	    uart_printf("PONG OK   retries=%u plos=%u RPD=%u\r\n", arc_cnt, plos_cnt, rpd);
+	  } else if (rc == -1) {
+	    uart_printf("FAIL MAX_RT   retries=%u plos=%u RPD=%u\r\n", arc_cnt, plos_cnt, rpd);
+	  } else {
+	    uart_printf("FAIL TIMEOUT  retries=%u plos=%u RPD=%u\r\n", arc_cnt, plos_cnt, rpd);
+	  }
+
 
 	  HAL_Delay(1000);
     /* USER CODE END WHILE */
