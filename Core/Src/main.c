@@ -285,8 +285,8 @@ static void nrf_init_link_common(void)
   // Retries: ARD=4 (1500us), ARC=15
   nrf_write_reg(NRF_REG_SETUP_RETR, 0x4F);
 
-  // RF_SETUP: 250kbps, max power (0 dBm)
-  nrf_write_reg(NRF_REG_RF_SETUP, 0x26);
+  // RF_SETUP: 250kbps, -6dBm
+  nrf_write_reg(NRF_REG_RF_SETUP, 0x24);
 
   // Addresses for pipe0 and TX (must match for auto-ack)
   nrf_write_reg_buf(NRF_REG_RX_ADDR_P0, addr, 5);
