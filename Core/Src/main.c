@@ -285,9 +285,8 @@ static void nrf_init_link_common(void)
   // Retries: ARD=4 (1500us), ARC=15
   nrf_write_reg(NRF_REG_SETUP_RETR, 0x4F);
 
-  // RF_SETUP: 1Mbps, max power (bits differ by module; this is common baseline)
-  // For plain nRF24L01+: 0x06 = 1Mbps, 0dBm. We’ll start with 0x06 since you already use it.
-  nrf_write_reg(NRF_REG_RF_SETUP, 0x06);
+  // RF_SETUP: 250kbps, max power (0 dBm)
+  nrf_write_reg(NRF_REG_RF_SETUP, 0x26);
 
   // Addresses for pipe0 and TX (must match for auto-ack)
   nrf_write_reg_buf(NRF_REG_RX_ADDR_P0, addr, 5);
@@ -436,7 +435,7 @@ int main(void)
 	  int rc = gateway_send_ping_wait_pong();
 
 	  uint8_t obs = nrf_read_reg(NRF_REG_OBSERVE_TX);
-	  uint8_t arc_cnt  = obs & 0x0F;
+	  uint8_t arc_cnt  = obs & 0x0F; // Auto Retransmit Count
 	  uint8_t plos_cnt = (obs >> 4) & 0x0F;
 	  uint8_t rpd = nrf_read_reg(NRF_REG_RPD);
 
