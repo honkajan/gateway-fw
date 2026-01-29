@@ -100,6 +100,14 @@ UART_HandleTypeDef huart1;
 uint8_t ch;
 static char line[64];
 static size_t line_len = 0;
+
+static uint32_t g_ping_total = 0;
+static uint32_t g_pong_ok = 0;
+static uint32_t g_fail_timeout = 0;
+static uint32_t g_fail_maxrt = 0;
+static uint32_t g_retries_sum = 0;
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -435,17 +443,44 @@ int main(void)
 	  int rc = gateway_send_ping_wait_pong();
 
 	  uint8_t obs = nrf_read_reg(NRF_REG_OBSERVE_TX);
-	  uint8_t arc_cnt  = obs & 0x0F; // Auto Retransmit Count
+	  uint8_t arc_cnt  = obs & 0x0F; // retries used for last TX
 	  uint8_t plos_cnt = (obs >> 4) & 0x0F;
 	  uint8_t rpd = nrf_read_reg(NRF_REG_RPD);
 
+	  g_ping_total++;
+	  g_retries_sum += arc_cnt;
+
 	  if (rc == 0) {
-	    uart_printf("PONG OK   retries=%u plos=%u RPD=%u\r\n", arc_cnt, plos_cnt, rpd);
+	    g_pong_ok++;
+	    uart_printf("PONG OK   retries=%u plos=%u RPD=%u  ok=%lu/%lu rt_fail=%lu\r\n",
+	                arc_cnt, plos_cnt, rpd,
+	                (unsigned long)g_pong_ok, (unsigned long)g_ping_total,
+	                (unsigned long)(g_fail_timeout + g_fail_maxrt));
 	  } else if (rc == -1) {
-	    uart_printf("FAIL MAX_RT   retries=%u plos=%u RPD=%u\r\n", arc_cnt, plos_cnt, rpd);
+	    g_fail_maxrt++;
+	    uart_printf("FAIL MAX_RT   retries=%u plos=%u RPD=%u  maxrt=%lu/%lu\r\n",
+	                arc_cnt, plos_cnt, rpd,
+	                (unsigned long)g_fail_maxrt, (unsigned long)g_ping_total);
 	  } else {
-	    uart_printf("FAIL TIMEOUT  retries=%u plos=%u RPD=%u\r\n", arc_cnt, plos_cnt, rpd);
+	    g_fail_timeout++;
+	    uart_printf("FAIL TIMEOUT  retries=%u plos=%u RPD=%u  timeout=%lu/%lu\r\n",
+	                arc_cnt, plos_cnt, rpd,
+	                (unsigned long)g_fail_timeout, (unsigned long)g_ping_total);
 	  }
+
+	  if ((g_ping_total % 60u) == 0u) {
+	    uint32_t rt_fail = g_fail_timeout + g_fail_maxrt;
+	    uint32_t avg_retry_x100 = (g_ping_total ? (g_retries_sum * 100u) / g_ping_total : 0);
+
+	    uart_printf("STATS: ok=%lu fail=%lu (timeout=%lu maxrt=%lu) avgRetry=%lu.%02lu\r\n",
+	                (unsigned long)g_pong_ok,
+	                (unsigned long)rt_fail,
+	                (unsigned long)g_fail_timeout,
+	                (unsigned long)g_fail_maxrt,
+	                (unsigned long)(avg_retry_x100 / 100u),
+	                (unsigned long)(avg_retry_x100 % 100u));
+	  }
+
 
 
 	  HAL_Delay(1000);
