@@ -101,11 +101,6 @@ uint8_t ch;
 static char line[64];
 static size_t line_len = 0;
 
-static uint32_t g_ping_total = 0;
-static uint32_t g_pong_ok = 0;
-static uint32_t g_fail_timeout = 0;
-static uint32_t g_fail_maxrt = 0;
-static uint32_t g_retries_sum = 0;
 
 
 /* USER CODE END PV */
@@ -396,6 +391,72 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
   return res;
 }
 
+typedef struct {
+  uint32_t ping_total;
+  uint32_t pong_ok;
+  uint32_t fail_timeout;
+  uint32_t fail_maxrt;
+  uint32_t retries_sum;
+} gw_stats_t;
+
+static void gw_handle_ping_result(gw_stats_t *s, const gw_ping_res_t *r)
+{
+  // Decode nRF OBSERVE_TX + RPD
+  const uint8_t arc_cnt  = (uint8_t)(r->observe_tx & 0x0F);         // retries used for last TX
+  const uint8_t plos_cnt = (uint8_t)((r->observe_tx >> 4) & 0x0F);  // 4-bit trend counter
+  const uint8_t rpd      = (uint8_t)(r->rpd & 0x01);
+
+  s->ping_total++;
+  s->retries_sum += arc_cnt;
+
+  if (r->rc == 0) {
+    s->pong_ok++;
+    uart_printf("PONG OK   retries=%u plos=%u RPD=%u ack=%u st=0x%02X  ok=%lu/%lu rt_fail=%lu\r\n",
+                arc_cnt, plos_cnt, rpd,
+                (unsigned)r->tx_acked, (unsigned)r->st_tx,
+                (unsigned long)s->pong_ok, (unsigned long)s->ping_total,
+                (unsigned long)(s->fail_timeout + s->fail_maxrt));
+  } else if (r->rc == -1) {
+    s->fail_maxrt++;
+    uart_printf("FAIL MAX_RT   retries=%u plos=%u RPD=%u ack=%u st=0x%02X  maxrt=%lu/%lu\r\n",
+                arc_cnt, plos_cnt, rpd,
+                (unsigned)r->tx_acked, (unsigned)r->st_tx,
+                (unsigned long)s->fail_maxrt, (unsigned long)s->ping_total);
+  } else if (r->rc == -2) {
+    s->fail_timeout++;
+    uart_printf("FAIL TIMEOUT  retries=%u plos=%u RPD=%u ack=%u st=0x%02X  timeout=%lu/%lu\r\n",
+                arc_cnt, plos_cnt, rpd,
+                (unsigned)r->tx_acked, (unsigned)r->st_tx,
+                (unsigned long)s->fail_timeout, (unsigned long)s->ping_total);
+  } else {
+    // TXWAIT timeout or other internal code
+    uart_printf("FAIL rc=%d   retries=%u plos=%u RPD=%u ack=%u st=0x%02X\r\n",
+                r->rc, arc_cnt, plos_cnt, rpd,
+                (unsigned)r->tx_acked, (unsigned)r->st_tx);
+  }
+}
+
+static void gw_maybe_print_stats(const gw_stats_t *s, uint32_t period)
+{
+  if (period == 0u) {
+    return;
+  }
+
+  if ((s->ping_total % period) == 0u) {
+    const uint32_t rt_fail = s->fail_timeout + s->fail_maxrt;
+    const uint32_t avg_retry_x100 = (s->ping_total ? (s->retries_sum * 100u) / s->ping_total : 0u);
+
+    uart_printf("STATS: ok=%lu fail=%lu (timeout=%lu maxrt=%lu) avgRetry=%lu.%02lu\r\n",
+                (unsigned long)s->pong_ok,
+                (unsigned long)rt_fail,
+                (unsigned long)s->fail_timeout,
+                (unsigned long)s->fail_maxrt,
+                (unsigned long)(avg_retry_x100 / 100u),
+                (unsigned long)(avg_retry_x100 % 100u));
+  }
+}
+
+
 
 static void nrf_print_rf_setup(void)
 {
@@ -478,55 +539,14 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	  static gw_stats_t s = {0};
+
 	  gw_ping_res_t r = gateway_send_ping_wait_pong();
-
-	  uint8_t arc_cnt  = (uint8_t)(r.observe_tx & 0x0F);         // retries used for last TX
-	  uint8_t plos_cnt = (uint8_t)((r.observe_tx >> 4) & 0x0F);  // 4-bit trend counter
-	  uint8_t rpd      = (uint8_t)(r.rpd & 0x01);
-
-	  g_ping_total++;
-	  g_retries_sum += arc_cnt;
-
-	  if (r.rc == 0) {
-	    g_pong_ok++;
-	    uart_printf("PONG OK   retries=%u plos=%u RPD=%u ack=%u st=0x%02X  ok=%lu/%lu rt_fail=%lu\r\n",
-	                arc_cnt, plos_cnt, rpd,
-	                (unsigned)r.tx_acked, (unsigned)r.st_tx,
-	                (unsigned long)g_pong_ok, (unsigned long)g_ping_total,
-	                (unsigned long)(g_fail_timeout + g_fail_maxrt));
-	  } else if (r.rc == -1) {
-	    g_fail_maxrt++;
-	    uart_printf("FAIL MAX_RT   retries=%u plos=%u RPD=%u ack=%u st=0x%02X  maxrt=%lu/%lu\r\n",
-	                arc_cnt, plos_cnt, rpd,
-	                (unsigned)r.tx_acked, (unsigned)r.st_tx,
-	                (unsigned long)g_fail_maxrt, (unsigned long)g_ping_total);
-	  } else if (r.rc == -2) {
-	    g_fail_timeout++;
-	    uart_printf("FAIL TIMEOUT  retries=%u plos=%u RPD=%u ack=%u st=0x%02X  timeout=%lu/%lu\r\n",
-	                arc_cnt, plos_cnt, rpd,
-	                (unsigned)r.tx_acked, (unsigned)r.st_tx,
-	                (unsigned long)g_fail_timeout, (unsigned long)g_ping_total);
-	  } else {
-	    // TXWAIT timeout or other internal code
-	    uart_printf("FAIL rc=%d   retries=%u plos=%u RPD=%u ack=%u st=0x%02X\r\n",
-	                r.rc, arc_cnt, plos_cnt, rpd,
-	                (unsigned)r.tx_acked, (unsigned)r.st_tx);
-	  }
-
-	  if ((g_ping_total % 60u) == 0u) {
-	    uint32_t rt_fail = g_fail_timeout + g_fail_maxrt;
-	    uint32_t avg_retry_x100 = (g_ping_total ? (g_retries_sum * 100u) / g_ping_total : 0);
-
-	    uart_printf("STATS: ok=%lu fail=%lu (timeout=%lu maxrt=%lu) avgRetry=%lu.%02lu\r\n",
-	                (unsigned long)g_pong_ok,
-	                (unsigned long)rt_fail,
-	                (unsigned long)g_fail_timeout,
-	                (unsigned long)g_fail_maxrt,
-	                (unsigned long)(avg_retry_x100 / 100u),
-	                (unsigned long)(avg_retry_x100 % 100u));
-	  }
+	  gw_handle_ping_result(&s, &r);
+	  gw_maybe_print_stats(&s, 60u);
 
 	  HAL_Delay(1000);
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
