@@ -311,13 +311,27 @@ static void nrf_init_link_common(void)
   nrf_set_rx_mode();
 }
 
-// Living-room node logic: send “PING” once per second and wait for “PONG”
-static int gateway_send_ping_wait_pong(void)
+typedef struct
 {
+  int     rc;          // 0=PONG OK, -1=MAX_RT, -2=TIMEOUT, -3=TXWAIT timeout
+  uint8_t st_tx;       // STATUS byte snapshot at TX completion
+  uint8_t observe_tx;  // OBSERVE_TX snapshot at TX completion (ARC_CNT + PLOS_CNT)
+  uint8_t rpd;         // RPD snapshot in RX mode (0/1)
+  uint8_t tx_acked;    // 1 if TX_DS observed (ACK received), else 0
+} gw_ping_res_t;
+
+
+// Living-room node logic: send “PING” once per second and wait for “PONG”
+static gw_ping_res_t gateway_send_ping_wait_pong(void)
+{
+  gw_ping_res_t res;
+  memset(&res, 0, sizeof(res));
+  res.rc = -2; // default TIMEOUT
+
   uint8_t tx[32] = {0};
   tx[0]='P'; tx[1]='I'; tx[2]='N'; tx[3]='G';
 
-  // TX
+  // --- TX phase ---
   nrf_set_tx_mode();
   nrf_clear_irqs();
   nrf_flush_tx();
@@ -331,20 +345,39 @@ static int gateway_send_ping_wait_pong(void)
   uint32_t start = HAL_GetTick();
   while ((HAL_GetTick() - start) < 100) {
     uint8_t st = nrf_get_status_cmd();
+
     if (st & (1u<<5)) { // TX_DS
+      res.st_tx = st;
+      res.tx_acked = 1;
       nrf_clear_irqs();
+      res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
       break;
     }
+
     if (st & (1u<<4)) { // MAX_RT
+      res.st_tx = st;
+      res.tx_acked = 0;
       nrf_clear_irqs();
+      res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
       nrf_flush_tx();
       nrf_set_rx_mode();
-      return -1;
+      res.rc = -1;
+      return res;
     }
   }
 
-  // Switch to RX and wait for response
+  // Neither TX_DS nor MAX_RT seen within window
+  if (res.st_tx == 0 && res.observe_tx == 0) {
+    res.st_tx = nrf_get_status_cmd();
+    res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
+    nrf_set_rx_mode();
+    res.rc = -3; // TXWAIT timeout
+    return res;
+  }
+
+  // --- RX wait phase (for PONG) ---
   nrf_set_rx_mode();
+
   start = HAL_GetTick();
   while ((HAL_GetTick() - start) < 200) {
     if (nrf_rx_available()) {
@@ -352,12 +385,17 @@ static int gateway_send_ping_wait_pong(void)
       nrf_read_payload32(rx);
       nrf_clear_irqs();
       if (rx[0]=='P' && rx[1]=='O' && rx[2]=='N' && rx[3]=='G') {
-        return 0;
+        res.rc = 0;
+        break;
       }
     }
   }
-  return -2;
+
+  // RPD is meaningful while in RX mode
+  res.rpd = (uint8_t)(nrf_read_reg(NRF_REG_RPD) & 1u);
+  return res;
 }
+
 
 static void nrf_print_rf_setup(void)
 {
@@ -440,32 +478,39 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  int rc = gateway_send_ping_wait_pong();
+	  gw_ping_res_t r = gateway_send_ping_wait_pong();
 
-	  uint8_t obs = nrf_read_reg(NRF_REG_OBSERVE_TX);
-	  uint8_t arc_cnt  = obs & 0x0F; // retries used for last TX
-	  uint8_t plos_cnt = (obs >> 4) & 0x0F;
-	  uint8_t rpd = nrf_read_reg(NRF_REG_RPD);
+	  uint8_t arc_cnt  = (uint8_t)(r.observe_tx & 0x0F);         // retries used for last TX
+	  uint8_t plos_cnt = (uint8_t)((r.observe_tx >> 4) & 0x0F);  // 4-bit trend counter
+	  uint8_t rpd      = (uint8_t)(r.rpd & 0x01);
 
 	  g_ping_total++;
 	  g_retries_sum += arc_cnt;
 
-	  if (rc == 0) {
+	  if (r.rc == 0) {
 	    g_pong_ok++;
-	    uart_printf("PONG OK   retries=%u plos=%u RPD=%u  ok=%lu/%lu rt_fail=%lu\r\n",
+	    uart_printf("PONG OK   retries=%u plos=%u RPD=%u ack=%u st=0x%02X  ok=%lu/%lu rt_fail=%lu\r\n",
 	                arc_cnt, plos_cnt, rpd,
+	                (unsigned)r.tx_acked, (unsigned)r.st_tx,
 	                (unsigned long)g_pong_ok, (unsigned long)g_ping_total,
 	                (unsigned long)(g_fail_timeout + g_fail_maxrt));
-	  } else if (rc == -1) {
+	  } else if (r.rc == -1) {
 	    g_fail_maxrt++;
-	    uart_printf("FAIL MAX_RT   retries=%u plos=%u RPD=%u  maxrt=%lu/%lu\r\n",
+	    uart_printf("FAIL MAX_RT   retries=%u plos=%u RPD=%u ack=%u st=0x%02X  maxrt=%lu/%lu\r\n",
 	                arc_cnt, plos_cnt, rpd,
+	                (unsigned)r.tx_acked, (unsigned)r.st_tx,
 	                (unsigned long)g_fail_maxrt, (unsigned long)g_ping_total);
-	  } else {
+	  } else if (r.rc == -2) {
 	    g_fail_timeout++;
-	    uart_printf("FAIL TIMEOUT  retries=%u plos=%u RPD=%u  timeout=%lu/%lu\r\n",
+	    uart_printf("FAIL TIMEOUT  retries=%u plos=%u RPD=%u ack=%u st=0x%02X  timeout=%lu/%lu\r\n",
 	                arc_cnt, plos_cnt, rpd,
+	                (unsigned)r.tx_acked, (unsigned)r.st_tx,
 	                (unsigned long)g_fail_timeout, (unsigned long)g_ping_total);
+	  } else {
+	    // TXWAIT timeout or other internal code
+	    uart_printf("FAIL rc=%d   retries=%u plos=%u RPD=%u ack=%u st=0x%02X\r\n",
+	                r.rc, arc_cnt, plos_cnt, rpd,
+	                (unsigned)r.tx_acked, (unsigned)r.st_tx);
 	  }
 
 	  if ((g_ping_total % 60u) == 0u) {
@@ -480,8 +525,6 @@ int main(void)
 	                (unsigned long)(avg_retry_x100 / 100u),
 	                (unsigned long)(avg_retry_x100 % 100u));
 	  }
-
-
 
 	  HAL_Delay(1000);
     /* USER CODE END WHILE */
