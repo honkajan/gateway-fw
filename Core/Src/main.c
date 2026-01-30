@@ -392,6 +392,129 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
 }
 
 typedef struct {
+  int rc;                 // 0=OK, -1=MAX_RT, -2=TIMEOUT, -3=TXWAIT timeout, -4=BAD_RSP
+  uint8_t st_tx;
+  uint8_t tx_acked;
+  uint8_t observe_tx;
+  uint8_t rpd;
+
+  // Payload
+  int32_t t0_mC;
+  int32_t t1_mC;
+  uint16_t flags;
+  uint16_t age_ms;
+  uint16_t a0;
+  uint16_t a1;
+} gw_temps_res_t;
+
+
+static uint16_t get_le16(const uint8_t *p)
+{
+  uint16_t v;
+  memcpy(&v, p, sizeof(v));
+  return v;
+}
+
+static uint32_t get_le32(const uint8_t *p)
+{
+  uint32_t v;
+  memcpy(&v, p, sizeof(v));
+  return v;
+}
+
+static gw_temps_res_t gateway_send_gtmp_wait_tmp(void)
+{
+  gw_temps_res_t res;
+  memset(&res, 0, sizeof(res));
+  res.rc = -2; // default TIMEOUT
+
+  uint8_t tx[32] = {0};
+  tx[0]='G'; tx[1]='T'; tx[2]='M'; tx[3]='P';
+
+  // --- TX phase ---
+  nrf_set_tx_mode();
+  nrf_clear_irqs();
+  nrf_flush_tx();
+  nrf_write_payload32(tx);
+
+  nrf_ce(1);
+  HAL_Delay(1);
+  nrf_ce(0);
+
+  // Wait TX done or max retries
+  uint32_t start = HAL_GetTick();
+  while ((HAL_GetTick() - start) < 100) {
+    const uint8_t st = nrf_get_status_cmd();
+
+    if (st & (1u<<5)) { // TX_DS
+      res.st_tx = st;
+      res.tx_acked = 1;
+      nrf_clear_irqs();
+      res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
+      break;
+    }
+
+    if (st & (1u<<4)) { // MAX_RT
+      res.st_tx = st;
+      res.tx_acked = 0;
+      nrf_clear_irqs();
+      res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
+      nrf_flush_tx();
+      nrf_set_rx_mode();
+      res.rc = -1;
+      return res;
+    }
+  }
+
+  // Neither TX_DS nor MAX_RT seen within window
+  if (res.st_tx == 0 && res.observe_tx == 0) {
+    res.st_tx = nrf_get_status_cmd();
+    res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
+    nrf_set_rx_mode();
+    res.rc = -3; // TXWAIT timeout
+    return res;
+  }
+
+  // --- RX wait phase (for TMP!) ---
+  nrf_set_rx_mode();
+
+  start = HAL_GetTick();
+  while ((HAL_GetTick() - start) < 200) {
+    if (nrf_rx_available()) {
+      uint8_t rx[32];
+      nrf_read_payload32(rx);
+      nrf_clear_irqs();
+
+      if (rx[0]=='T' && rx[1]=='M' && rx[2]=='P' && rx[3]=='!') {
+        // Decode payload (matches remote layout)
+        res.t0_mC  = (int32_t)get_le32(&rx[4]);
+        res.t1_mC  = (int32_t)get_le32(&rx[8]);
+        res.flags  = get_le16(&rx[12]);
+        res.age_ms = get_le16(&rx[14]);
+        res.a0     = get_le16(&rx[16]);
+        res.a1     = get_le16(&rx[18]);
+
+        res.rc = 0;
+        break;
+      } else {
+        // got something else (maybe a stray PONG), keep waiting
+      }
+    }
+  }
+
+  res.rpd = (uint8_t)(nrf_read_reg(NRF_REG_RPD) & 1u);
+
+  if (res.rc != 0) {
+    // timed out without matching TMP! response
+    res.rc = -2;
+  }
+
+  return res;
+}
+
+
+
+typedef struct {
   uint32_t ping_total;
   uint32_t pong_ok;
   uint32_t fail_timeout;
@@ -604,13 +727,24 @@ int main(void)
 
 	  // Run RF ping once per second
 	  const uint32_t now = HAL_GetTick();
-	  if ((int32_t)(now - next_ping_ms) >= 0)
-	  {
+	  if ((int32_t)(now - next_ping_ms) >= 0) {
 	    next_ping_ms = now + 1000u;
 
-	    gw_ping_res_t r = gateway_send_ping_wait_pong();
-	    gw_handle_ping_result(&s, &r);
-	    gw_maybe_print_stats(&s, 60u);
+	    static uint8_t flip = 0;
+	    if (flip == 0)
+	    {
+		    gw_ping_res_t r = gateway_send_ping_wait_pong();
+		    gw_handle_ping_result(&s, &r);
+		    gw_maybe_print_stats(&s, 60u);
+	    } else {
+			gw_temps_res_t tr = gateway_send_gtmp_wait_tmp();
+			// print: tr.t0_mC, tr.t1_mC, tr.age_ms + your rf diags tr.observe_tx/tr.rpd etc.
+			uart_printf("ADC0=%u ADC1=%u  T0=%ld mC  T1=%ld mC\r\n",
+						(unsigned)tr.a0, (unsigned)tr.a1,
+						(long)tr.t0_mC, (long)tr.t1_mC);
+	    }
+	    flip ^= 1;
+
 	  }
 
 	  // Optional: tiny sleep to reduce CPU burn (still responsive)
