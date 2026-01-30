@@ -489,6 +489,63 @@ static void nrf_print_rf_setup(void)
   );
 }
 
+static void host_cmd_poll_uart1(void)
+{
+  static uint8_t ch;
+  static char line[64];
+  static size_t line_len = 0;
+
+  // Non-blocking poll: read as many available bytes as possible
+  while (HAL_UART_Receive(&huart1, &ch, 1, 0) == HAL_OK)
+  {
+    if (ch == '\r')
+    {
+      // ignore CR
+    }
+    else if (ch == '\n')
+    {
+      line[line_len] = '\0';
+
+      if (strcmp(line, "PING") == 0)
+      {
+        uart_send_str(&huart1, "PONG\n");
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13); // optional
+      }
+      else if (strcmp(line, "ID?") == 0)
+      {
+        uart_send_str(&huart1, FW_ID_STRING "\n");
+      }
+      else if (strcmp(line, "VER?") == 0)
+      {
+        uart_send_version(&huart1);
+      }
+      else if (strcmp(line, "UPTIME?") == 0)
+      {
+        uart_send_uptime(&huart1);
+      }
+      else
+      {
+        uart_send_str(&huart1, "ERR\n");
+      }
+
+      line_len = 0;
+    }
+    else
+    {
+      if (line_len < (sizeof(line) - 1))
+      {
+        line[line_len++] = (char)ch;
+      }
+      else
+      {
+        // overflow -> reset and complain
+        line_len = 0;
+        uart_send_str(&huart1, "ERR\n");
+      }
+    }
+  }
+}
+
 
 
 /* USER CODE END 0 */
@@ -540,13 +597,24 @@ int main(void)
   while (1)
   {
 	  static gw_stats_t s = {0};
+	  static uint32_t next_ping_ms = 0;
 
-	  gw_ping_res_t r = gateway_send_ping_wait_pong();
-	  gw_handle_ping_result(&s, &r);
-	  gw_maybe_print_stats(&s, 60u);
+	  // Always keep UART responsive
+	  host_cmd_poll_uart1();
 
-	  HAL_Delay(1000);
+	  // Run RF ping once per second
+	  const uint32_t now = HAL_GetTick();
+	  if ((int32_t)(now - next_ping_ms) >= 0)
+	  {
+	    next_ping_ms = now + 1000u;
 
+	    gw_ping_res_t r = gateway_send_ping_wait_pong();
+	    gw_handle_ping_result(&s, &r);
+	    gw_maybe_print_stats(&s, 60u);
+	  }
+
+	  // Optional: tiny sleep to reduce CPU burn (still responsive)
+	  // HAL_Delay(1);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
