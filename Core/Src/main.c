@@ -262,6 +262,18 @@ static void nrf_set_tx_mode(void)
 }
 
 
+static void nrf_drain_rx(void)
+{
+  uint8_t rx[32];
+  while (nrf_rx_available()) {
+    nrf_read_payload32(rx);
+    // Don’t care what it was; we’re draining.
+  }
+  nrf_clear_irqs();
+}
+
+
+
 // Common link init (call on both nodes)
 static void nrf_init_link_common(void)
 {
@@ -304,7 +316,10 @@ static void nrf_init_link_common(void)
 
   // Start in RX mode
   nrf_set_rx_mode();
+  nrf_flush_rx();
+  nrf_drain_rx();     // belt + suspenders
 }
+
 
 typedef struct
 {
@@ -355,7 +370,10 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
       nrf_clear_irqs();
       res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
       nrf_flush_tx();
+      nrf_flush_rx();
       nrf_set_rx_mode();
+      nrf_flush_rx();
+      nrf_drain_rx();     // belt + suspenders
       res.rc = -1;
       return res;
     }
@@ -366,6 +384,8 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
     res.st_tx = nrf_get_status_cmd();
     res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
     nrf_set_rx_mode();
+    nrf_flush_rx();
+    nrf_drain_rx();     // belt + suspenders
     res.rc = -3; // TXWAIT timeout
     return res;
   }
@@ -373,6 +393,7 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
   // --- RX wait phase (for PONG) ---
   nrf_set_rx_mode();
   nrf_flush_rx();      // important: discard stale payloads
+  nrf_drain_rx();     // belt + suspenders
   nrf_clear_irqs();
 
   start = HAL_GetTick();
@@ -466,7 +487,10 @@ static gw_temps_res_t gateway_send_gtmp_wait_tmp(void)
       nrf_clear_irqs();
       res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
       nrf_flush_tx();
+      nrf_flush_rx();
       nrf_set_rx_mode();
+      nrf_flush_rx();
+      nrf_drain_rx();     // belt + suspenders
       res.rc = -1;
       return res;
     }
@@ -477,36 +501,39 @@ static gw_temps_res_t gateway_send_gtmp_wait_tmp(void)
     res.st_tx = nrf_get_status_cmd();
     res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
     nrf_set_rx_mode();
+    nrf_flush_rx();
+    nrf_drain_rx();     // belt + suspenders
     res.rc = -3; // TXWAIT timeout
     return res;
   }
 
   // --- RX wait phase (for TMP!) ---
   nrf_set_rx_mode();
+  nrf_flush_rx();
+  nrf_drain_rx();     // belt + suspenders
 
   start = HAL_GetTick();
   while ((HAL_GetTick() - start) < 200) {
-    if (nrf_rx_available()) {
+    while (nrf_rx_available()) {
       uint8_t rx[32];
       nrf_read_payload32(rx);
       nrf_clear_irqs();
 
       if (rx[0]=='T' && rx[1]=='M' && rx[2]=='P' && rx[3]=='!') {
-        // Decode payload (matches remote layout)
-        res.t0_mC  = (int32_t)get_le32(&rx[4]);
-        res.t1_mC  = (int32_t)get_le32(&rx[8]);
-        res.flags  = get_le16(&rx[12]);
-        res.age_ms = get_le16(&rx[14]);
-        res.a0     = get_le16(&rx[16]);
-        res.a1     = get_le16(&rx[18]);
+          // Decode payload (matches remote layout)
+          res.t0_mC  = (int32_t)get_le32(&rx[4]);
+          res.t1_mC  = (int32_t)get_le32(&rx[8]);
+          res.flags  = get_le16(&rx[12]);
+          res.age_ms = get_le16(&rx[14]);
+          res.a0     = get_le16(&rx[16]);
+          res.a1     = get_le16(&rx[18]);
 
         res.rc = 0;
-        break;
-      } else {
-        // got something else (maybe a stray PONG), keep waiting
+        goto out;
       }
     }
   }
+  out:
 
   res.rpd = (uint8_t)(nrf_read_reg(NRF_REG_RPD) & 1u);
 
@@ -767,6 +794,7 @@ int main(void)
 	      nrf_init_link_common();
 	      nrf_set_rx_mode();
 	      nrf_flush_rx();
+	      nrf_drain_rx();     // belt + suspenders
 	      nrf_flush_tx();
 	      nrf_clear_irqs();
 	      consec_fail = 0;
