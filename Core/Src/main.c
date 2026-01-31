@@ -727,11 +727,12 @@ int main(void)
   {
 	  static gw_stats_t s = {0};
 	  static uint32_t next_ping_ms = 0;
+	  static uint32_t consec_fail = 0;
 
 	  // Always keep UART responsive
 	  host_cmd_poll_uart1();
 
-	  // Run RF ping once per second
+	  // Run RF requests once per second
 	  const uint32_t now = HAL_GetTick();
 	  if ((int32_t)(now - next_ping_ms) >= 0) {
 	    next_ping_ms = now + 1000u;
@@ -740,21 +741,36 @@ int main(void)
 	    if (flip == 0)
 	    {
 		    gw_ping_res_t r = gateway_send_ping_wait_pong();
+		    if (r.rc == 0) consec_fail = 0;
+		    else consec_fail++;
+
 		    gw_handle_ping_result(&s, &r);
 		    gw_maybe_print_stats(&s, 60u);
 	    } else {
 			gw_temps_res_t tr = gateway_send_gtmp_wait_tmp();
 			if (tr.rc == 0) {
+			  consec_fail = 0;
 			  uart_printf("ADC0=%u ADC1=%u  T0=%ld mC  T1=%ld mC age=%u flags=0x%04X\r\n",
 			              (unsigned)tr.a0, (unsigned)tr.a1,
 			              (long)tr.t0_mC, (long)tr.t1_mC,
 			              (unsigned)tr.age_ms, (unsigned)tr.flags);
 			} else {
+			  consec_fail++;
 			  uart_printf("GTMP FAIL rc=%d st=0x%02X obs=0x%02X rpd=%u\r\n",
 			              tr.rc, tr.st_tx, tr.observe_tx, tr.rpd);
 			}
 	    }
 	    flip ^= 1;
+
+	    if (consec_fail >= 5) {
+	      uart_printf("NRF reinit after %lu fails\r\n", (unsigned long)consec_fail);
+	      nrf_init_link_common();
+	      nrf_set_rx_mode();
+	      nrf_flush_rx();
+	      nrf_flush_tx();
+	      nrf_clear_irqs();
+	      consec_fail = 0;
+	    }
 
 	  }
 
