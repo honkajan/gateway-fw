@@ -372,19 +372,25 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
 
   // --- RX wait phase (for PONG) ---
   nrf_set_rx_mode();
+  nrf_flush_rx();      // important: discard stale payloads
+  nrf_clear_irqs();
 
   start = HAL_GetTick();
   while ((HAL_GetTick() - start) < 200) {
-    if (nrf_rx_available()) {
+    while (nrf_rx_available()) {
       uint8_t rx[32];
       nrf_read_payload32(rx);
+
+      // Clear RX_DR after reading (ok to do once per drain pass too)
       nrf_clear_irqs();
+
       if (rx[0]=='P' && rx[1]=='O' && rx[2]=='N' && rx[3]=='G') {
         res.rc = 0;
-        break;
+        goto out_rx;
       }
     }
   }
+  out_rx:
 
   // RPD is meaningful while in RX mode
   res.rpd = (uint8_t)(nrf_read_reg(NRF_REG_RPD) & 1u);
@@ -738,10 +744,15 @@ int main(void)
 		    gw_maybe_print_stats(&s, 60u);
 	    } else {
 			gw_temps_res_t tr = gateway_send_gtmp_wait_tmp();
-			// print: tr.t0_mC, tr.t1_mC, tr.age_ms + your rf diags tr.observe_tx/tr.rpd etc.
-			uart_printf("ADC0=%u ADC1=%u  T0=%ld mC  T1=%ld mC\r\n",
-						(unsigned)tr.a0, (unsigned)tr.a1,
-						(long)tr.t0_mC, (long)tr.t1_mC);
+			if (tr.rc == 0) {
+			  uart_printf("ADC0=%u ADC1=%u  T0=%ld mC  T1=%ld mC age=%u flags=0x%04X\r\n",
+			              (unsigned)tr.a0, (unsigned)tr.a1,
+			              (long)tr.t0_mC, (long)tr.t1_mC,
+			              (unsigned)tr.age_ms, (unsigned)tr.flags);
+			} else {
+			  uart_printf("GTMP FAIL rc=%d st=0x%02X obs=0x%02X rpd=%u\r\n",
+			              tr.rc, tr.st_tx, tr.observe_tx, tr.rpd);
+			}
 	    }
 	    flip ^= 1;
 
