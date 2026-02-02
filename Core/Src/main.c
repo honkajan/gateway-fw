@@ -24,6 +24,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdbool.h>
+
 
 /* USER CODE END Includes */
 
@@ -97,9 +99,9 @@ SPI_HandleTypeDef hspi1;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-uint8_t ch;
-static char line[64];
-static size_t line_len = 0;
+//uint8_t ch;
+//static char line[64];
+//static size_t line_len = 0;
 
 
 
@@ -221,6 +223,31 @@ static void nrf_clear_irqs(void)
   nrf_write_reg(NRF_REG_STATUS, 0x70);
 }
 
+static void nrf_enter_rx_clean(void)
+{
+  nrf_ce(0);
+
+  nrf_flush_rx();
+  nrf_clear_irqs();
+
+  nrf_write_reg(NRF_REG_CONFIG, 0x0F); // PWR_UP=1, PRIM_RX=1, CRC enabled
+  HAL_Delay(2);
+
+  nrf_ce(1);
+}
+
+static void nrf_enter_tx_clean(void)
+{
+  nrf_ce(0);
+
+  nrf_clear_irqs();
+  nrf_flush_tx();
+
+  nrf_write_reg(NRF_REG_CONFIG, 0x0E); // PWR_UP=1, PRIM_RX=0, CRC enabled
+  HAL_Delay(2);
+}
+
+
 // Payload IO
 static int nrf_rx_available(void)
 {
@@ -315,9 +342,8 @@ static void nrf_init_link_common(void)
   nrf_clear_irqs();
 
   // Start in RX mode
-  nrf_set_rx_mode();
-  nrf_flush_rx();
-  nrf_drain_rx();     // belt + suspenders
+  nrf_enter_rx_clean();
+
 }
 
 
@@ -342,9 +368,7 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
   tx[0]='P'; tx[1]='I'; tx[2]='N'; tx[3]='G';
 
   // --- TX phase ---
-  nrf_set_tx_mode();
-  nrf_clear_irqs();
-  nrf_flush_tx();
+  nrf_enter_tx_clean();
   nrf_write_payload32(tx);
 
   nrf_ce(1);
@@ -370,10 +394,7 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
       nrf_clear_irqs();
       res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
       nrf_flush_tx();
-      nrf_flush_rx();
-      nrf_set_rx_mode();
-      nrf_flush_rx();
-      nrf_drain_rx();     // belt + suspenders
+      nrf_enter_rx_clean();
       res.rc = -1;
       return res;
     }
@@ -381,20 +402,27 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
 
   // Neither TX_DS nor MAX_RT seen within window
   if (res.st_tx == 0 && res.observe_tx == 0) {
+    // Snapshot diagnostics before wiping state
     res.st_tx = nrf_get_status_cmd();
     res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
-    nrf_set_rx_mode();
-    nrf_flush_rx();
-    nrf_drain_rx();     // belt + suspenders
+
+    // Recover: assume TX engine is wedged or packet is stuck
+    nrf_ce(0);
+    nrf_clear_irqs();
+    nrf_flush_tx();
+
+    // Optional if you have seen RX FIFO pollution / stray frames
+    // nrf_flush_rx();
+
+    nrf_enter_rx_clean();
+
     res.rc = -3; // TXWAIT timeout
     return res;
   }
 
   // --- RX wait phase (for PONG) ---
-  nrf_set_rx_mode();
-  nrf_flush_rx();      // important: discard stale payloads
-  nrf_drain_rx();     // belt + suspenders
-  nrf_clear_irqs();
+  nrf_enter_rx_clean();
+
 
   start = HAL_GetTick();
   while ((HAL_GetTick() - start) < 200) {
@@ -459,9 +487,7 @@ static gw_temps_res_t gateway_send_gtmp_wait_tmp(void)
   tx[0]='G'; tx[1]='T'; tx[2]='M'; tx[3]='P';
 
   // --- TX phase ---
-  nrf_set_tx_mode();
-  nrf_clear_irqs();
-  nrf_flush_tx();
+  nrf_enter_tx_clean();
   nrf_write_payload32(tx);
 
   nrf_ce(1);
@@ -469,6 +495,7 @@ static gw_temps_res_t gateway_send_gtmp_wait_tmp(void)
   nrf_ce(0);
 
   // Wait TX done or max retries
+  bool tx_done = false;
   uint32_t start = HAL_GetTick();
   while ((HAL_GetTick() - start) < 100) {
     const uint8_t st = nrf_get_status_cmd();
@@ -478,6 +505,7 @@ static gw_temps_res_t gateway_send_gtmp_wait_tmp(void)
       res.tx_acked = 1;
       nrf_clear_irqs();
       res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
+      tx_done=true;
       break;
     }
 
@@ -487,30 +515,35 @@ static gw_temps_res_t gateway_send_gtmp_wait_tmp(void)
       nrf_clear_irqs();
       res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
       nrf_flush_tx();
-      nrf_flush_rx();
-      nrf_set_rx_mode();
-      nrf_flush_rx();
-      nrf_drain_rx();     // belt + suspenders
+      nrf_enter_rx_clean();
       res.rc = -1;
       return res;
     }
   }
 
   // Neither TX_DS nor MAX_RT seen within window
-  if (res.st_tx == 0 && res.observe_tx == 0) {
+  if (!tx_done) {
+    // Snapshot diagnostics before wiping state
     res.st_tx = nrf_get_status_cmd();
     res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
-    nrf_set_rx_mode();
-    nrf_flush_rx();
-    nrf_drain_rx();     // belt + suspenders
+
+    // Recover: assume TX engine is wedged or packet is stuck
+    nrf_ce(0);
+    nrf_clear_irqs();
+    nrf_flush_tx();
+
+    // Optional if you have seen RX FIFO pollution / stray frames
+    // nrf_flush_rx();
+
+    nrf_enter_rx_clean();
+
     res.rc = -3; // TXWAIT timeout
     return res;
   }
 
   // --- RX wait phase (for TMP!) ---
-  nrf_set_rx_mode();
-  nrf_flush_rx();
-  nrf_drain_rx();     // belt + suspenders
+  nrf_enter_rx_clean();
+
 
   start = HAL_GetTick();
   while ((HAL_GetTick() - start) < 200) {
@@ -792,11 +825,6 @@ int main(void)
 	    if (consec_fail >= 5) {
 	      uart_printf("NRF reinit after %lu fails\r\n", (unsigned long)consec_fail);
 	      nrf_init_link_common();
-	      nrf_set_rx_mode();
-	      nrf_flush_rx();
-	      nrf_drain_rx();     // belt + suspenders
-	      nrf_flush_tx();
-	      nrf_clear_irqs();
 	      consec_fail = 0;
 	    }
 
