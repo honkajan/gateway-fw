@@ -321,6 +321,93 @@ static void nrf_init_link_common(void)
 
 }
 
+typedef struct {
+  int rc;                 // 0 OK, -1 MAX_RT, -2 RX TIMEOUT, -3 TXWAIT
+  uint8_t st_tx;
+  uint8_t tx_acked;
+  uint8_t observe_tx;
+  uint8_t rpd;
+} gw_rf_diag_t;
+
+static gw_rf_diag_t gw_txrx_expect4(const uint8_t req4[4],
+                                    const uint8_t rsp4[4],
+                                    uint8_t out_rx32[32],
+                                    uint32_t tx_wait_ms,
+                                    uint32_t rx_wait_ms)
+{
+  gw_rf_diag_t d;
+  memset(&d, 0, sizeof(d));
+  d.rc = -2;
+
+  uint8_t tx[32] = {0};
+  memcpy(tx, req4, 4);
+
+  nrf_enter_tx_clean();
+  nrf_write_payload32(tx);
+
+  nrf_ce(1);
+  HAL_Delay(1);
+  nrf_ce(0);
+
+  bool tx_done = false;
+  uint32_t start = HAL_GetTick();
+  while ((HAL_GetTick() - start) < tx_wait_ms) {
+    uint8_t st = nrf_get_status_cmd();
+
+    if (st & (1u<<5)) { // TX_DS
+      d.st_tx = st;
+      d.tx_acked = 1;
+      nrf_clear_irqs();
+      d.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
+      tx_done = true;
+      break;
+    }
+
+    if (st & (1u<<4)) { // MAX_RT
+      d.st_tx = st;
+      d.tx_acked = 0;
+      nrf_clear_irqs();
+      d.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
+      nrf_flush_tx();
+      nrf_enter_rx_clean();
+      d.rc = -1;
+      return d;
+    }
+  }
+
+  if (!tx_done) {
+    d.st_tx = nrf_get_status_cmd();
+    d.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
+    nrf_ce(0);
+    nrf_clear_irqs();
+    nrf_flush_tx();
+    nrf_enter_rx_clean();
+    d.rc = -3;
+    return d;
+  }
+
+  nrf_enter_rx_clean();
+
+  start = HAL_GetTick();
+  while ((HAL_GetTick() - start) < rx_wait_ms) {
+    while (nrf_rx_available()) {
+      nrf_read_payload32(out_rx32);
+      nrf_clear_irqs();
+
+      if (out_rx32[0]==rsp4[0] && out_rx32[1]==rsp4[1] &&
+          out_rx32[2]==rsp4[2] && out_rx32[3]==rsp4[3]) {
+        d.rc = 0;
+        goto out;
+      }
+    }
+  }
+
+out:
+  d.rpd = (uint8_t)(nrf_read_reg(NRF_REG_RPD) & 1u);
+  if (d.rc != 0) d.rc = -2;
+  return d;
+}
+
 
 typedef struct
 {
@@ -331,98 +418,25 @@ typedef struct
   uint8_t tx_acked;    // 1 if TX_DS observed (ACK received), else 0
 } gw_ping_res_t;
 
-
-// Living-room node logic: send “PING” once per second and wait for “PONG”
 static gw_ping_res_t gateway_send_ping_wait_pong(void)
 {
-  gw_ping_res_t res;
-  memset(&res, 0, sizeof(res));
-  res.rc = -2; // default TIMEOUT
+  static const uint8_t req[4] = {'P','I','N','G'};
+  static const uint8_t rsp[4] = {'P','O','N','G'};
+  uint8_t rx[32];
 
-  uint8_t tx[32] = {0};
-  tx[0]='P'; tx[1]='I'; tx[2]='N'; tx[3]='G';
+  gw_rf_diag_t d = gw_txrx_expect4(req, rsp, rx, 100, 200);
 
-  // --- TX phase ---
-  nrf_enter_tx_clean();
-  nrf_write_payload32(tx);
-
-  nrf_ce(1);
-  HAL_Delay(1);
-  nrf_ce(0);
-
-  // Wait TX done or max retries
-  bool tx_done = false;
-  uint32_t start = HAL_GetTick();
-  while ((HAL_GetTick() - start) < 100) {
-    uint8_t st = nrf_get_status_cmd();
-
-    if (st & (1u<<5)) { // TX_DS
-      res.st_tx = st;
-      res.tx_acked = 1;
-      nrf_clear_irqs();
-      res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
-      tx_done = true;
-      break;
-    }
-
-    if (st & (1u<<4)) { // MAX_RT
-      res.st_tx = st;
-      res.tx_acked = 0;
-      nrf_clear_irqs();
-      res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
-      nrf_flush_tx();
-      nrf_enter_rx_clean();
-      res.rc = -1;
-      return res;
-    }
-  }
-
-  // Neither TX_DS nor MAX_RT seen within window
-  if (!tx_done) {
-    // Snapshot diagnostics before wiping state
-    res.st_tx = nrf_get_status_cmd();
-    res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
-
-    // Recover: assume TX engine is wedged or packet is stuck
-    nrf_ce(0);
-    nrf_clear_irqs();
-    nrf_flush_tx();
-
-    // Optional if you have seen RX FIFO pollution / stray frames
-    // nrf_flush_rx();
-
-    nrf_enter_rx_clean();
-
-    res.rc = -3; // TXWAIT timeout
-    return res;
-  }
-
-
-  // --- RX wait phase (for PONG) ---
-  nrf_enter_rx_clean();
-
-
-  start = HAL_GetTick();
-  while ((HAL_GetTick() - start) < 200) {
-    while (nrf_rx_available()) {
-      uint8_t rx[32];
-      nrf_read_payload32(rx);
-
-      // Clear RX_DR after reading (ok to do once per drain pass too)
-      nrf_clear_irqs();
-
-      if (rx[0]=='P' && rx[1]=='O' && rx[2]=='N' && rx[3]=='G') {
-        res.rc = 0;
-        goto out_rx;
-      }
-    }
-  }
-  out_rx:
-
-  // RPD is meaningful while in RX mode
-  res.rpd = (uint8_t)(nrf_read_reg(NRF_REG_RPD) & 1u);
-  return res;
+  gw_ping_res_t r = {0};
+  r.rc = d.rc;
+  r.st_tx = d.st_tx;
+  r.observe_tx = d.observe_tx;
+  r.rpd = d.rpd;
+  r.tx_acked = d.tx_acked;
+  return r;
 }
+
+
+
 
 typedef struct {
   int rc;                 // 0=OK, -1=MAX_RT, -2=TIMEOUT, -3=TXWAIT timeout, -4=BAD_RSP
@@ -457,104 +471,31 @@ static uint32_t get_le32(const uint8_t *p)
 
 static gw_temps_res_t gateway_send_gtmp_wait_tmp(void)
 {
-  gw_temps_res_t res;
-  memset(&res, 0, sizeof(res));
-  res.rc = -2; // default TIMEOUT
+  static const uint8_t req[4] = {'G','T','M','P'};
+  static const uint8_t rsp[4] = {'T','M','P','!'};
+  uint8_t rx[32];
 
-  uint8_t tx[32] = {0};
-  tx[0]='G'; tx[1]='T'; tx[2]='M'; tx[3]='P';
+  gw_rf_diag_t d = gw_txrx_expect4(req, rsp, rx, 100, 200);
 
-  // --- TX phase ---
-  nrf_enter_tx_clean();
-  nrf_write_payload32(tx);
+  gw_temps_res_t tr = {0};
+  tr.rc = d.rc;
+  tr.st_tx = d.st_tx;
+  tr.observe_tx = d.observe_tx;
+  tr.rpd = d.rpd;
+  tr.tx_acked = d.tx_acked;
 
-  nrf_ce(1);
-  HAL_Delay(1);
-  nrf_ce(0);
-
-  // Wait TX done or max retries
-  bool tx_done = false;
-  uint32_t start = HAL_GetTick();
-  while ((HAL_GetTick() - start) < 100) {
-    const uint8_t st = nrf_get_status_cmd();
-
-    if (st & (1u<<5)) { // TX_DS
-      res.st_tx = st;
-      res.tx_acked = 1;
-      nrf_clear_irqs();
-      res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
-      tx_done=true;
-      break;
-    }
-
-    if (st & (1u<<4)) { // MAX_RT
-      res.st_tx = st;
-      res.tx_acked = 0;
-      nrf_clear_irqs();
-      res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
-      nrf_flush_tx();
-      nrf_enter_rx_clean();
-      res.rc = -1;
-      return res;
-    }
+  if (tr.rc == 0) {
+    tr.t0_mC  = (int32_t)get_le32(&rx[4]);
+    tr.t1_mC  = (int32_t)get_le32(&rx[8]);
+    tr.flags  = get_le16(&rx[12]);
+    tr.age_ms = get_le16(&rx[14]);
+    tr.a0     = get_le16(&rx[16]);
+    tr.a1     = get_le16(&rx[18]);
   }
 
-  // Neither TX_DS nor MAX_RT seen within window
-  if (!tx_done) {
-    // Snapshot diagnostics before wiping state
-    res.st_tx = nrf_get_status_cmd();
-    res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
-
-    // Recover: assume TX engine is wedged or packet is stuck
-    nrf_ce(0);
-    nrf_clear_irqs();
-    nrf_flush_tx();
-
-    // Optional if you have seen RX FIFO pollution / stray frames
-    // nrf_flush_rx();
-
-    nrf_enter_rx_clean();
-
-    res.rc = -3; // TXWAIT timeout
-    return res;
-  }
-
-  // --- RX wait phase (for TMP!) ---
-  nrf_enter_rx_clean();
-
-
-  start = HAL_GetTick();
-  while ((HAL_GetTick() - start) < 200) {
-    while (nrf_rx_available()) {
-      uint8_t rx[32];
-      nrf_read_payload32(rx);
-      nrf_clear_irqs();
-
-      if (rx[0]=='T' && rx[1]=='M' && rx[2]=='P' && rx[3]=='!') {
-          // Decode payload (matches remote layout)
-          res.t0_mC  = (int32_t)get_le32(&rx[4]);
-          res.t1_mC  = (int32_t)get_le32(&rx[8]);
-          res.flags  = get_le16(&rx[12]);
-          res.age_ms = get_le16(&rx[14]);
-          res.a0     = get_le16(&rx[16]);
-          res.a1     = get_le16(&rx[18]);
-
-        res.rc = 0;
-        goto out;
-      }
-    }
-  }
-  out:
-
-  res.rpd = (uint8_t)(nrf_read_reg(NRF_REG_RPD) & 1u);
-
-  if (res.rc != 0) {
-    // timed out without matching TMP! response
-    res.rc = -2;
-  }
-
-  return res;
+  return tr;
 }
+
 
 
 
