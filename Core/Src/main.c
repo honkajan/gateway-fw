@@ -157,10 +157,14 @@ static void uart_printf(const char *fmt, ...)
   va_end(ap);
 
   if (n < 0) return;
-  if (n > (int)sizeof(buf)) n = sizeof(buf);
 
-  HAL_UART_Transmit(&huart1, (uint8_t*)buf, (uint16_t)strlen(buf), HAL_MAX_DELAY);
+  if ((size_t)n >= sizeof(buf)) {
+    n = (int)sizeof(buf) - 1; // buf is still NUL-terminated by vsnprintf
+  }
+
+  HAL_UART_Transmit(&huart1, (uint8_t*)buf, (uint16_t)n, HAL_MAX_DELAY);
 }
+
 
 // SPI xfer
 static uint8_t nrf_spi_xfer(uint8_t b)
@@ -272,35 +276,6 @@ static void nrf_write_payload32(const uint8_t *p32)
 }
 
 
-// Mode switching
-static void nrf_set_rx_mode(void)
-{
-  nrf_ce(0);
-  nrf_write_reg(NRF_REG_CONFIG, 0x0F); // PWR_UP=1, PRIM_RX=1, CRC enabled
-  HAL_Delay(2);
-  nrf_ce(1);
-}
-
-static void nrf_set_tx_mode(void)
-{
-  nrf_ce(0);
-  nrf_write_reg(NRF_REG_CONFIG, 0x0E); // PWR_UP=1, PRIM_RX=0, CRC enabled
-  HAL_Delay(2);
-}
-
-
-static void nrf_drain_rx(void)
-{
-  uint8_t rx[32];
-  while (nrf_rx_available()) {
-    nrf_read_payload32(rx);
-    // Don’t care what it was; we’re draining.
-  }
-  nrf_clear_irqs();
-}
-
-
-
 // Common link init (call on both nodes)
 static void nrf_init_link_common(void)
 {
@@ -376,6 +351,7 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
   nrf_ce(0);
 
   // Wait TX done or max retries
+  bool tx_done = false;
   uint32_t start = HAL_GetTick();
   while ((HAL_GetTick() - start) < 100) {
     uint8_t st = nrf_get_status_cmd();
@@ -385,6 +361,7 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
       res.tx_acked = 1;
       nrf_clear_irqs();
       res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
+      tx_done = true;
       break;
     }
 
@@ -401,7 +378,7 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
   }
 
   // Neither TX_DS nor MAX_RT seen within window
-  if (res.st_tx == 0 && res.observe_tx == 0) {
+  if (!tx_done) {
     // Snapshot diagnostics before wiping state
     res.st_tx = nrf_get_status_cmd();
     res.observe_tx = nrf_read_reg(NRF_REG_OBSERVE_TX);
@@ -419,6 +396,7 @@ static gw_ping_res_t gateway_send_ping_wait_pong(void)
     res.rc = -3; // TXWAIT timeout
     return res;
   }
+
 
   // --- RX wait phase (for PONG) ---
   nrf_enter_rx_clean();
