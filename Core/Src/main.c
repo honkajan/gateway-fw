@@ -597,6 +597,53 @@ static void nrf_print_rf_setup(void)
   );
 }
 
+static void gateway_periodic_rf_task(void)
+{
+  static gw_stats_t s = {0};
+  static uint32_t next_ping_ms = 0;
+  static uint32_t consec_fail = 0;
+  static uint8_t flip = 0;
+
+  const uint32_t now = HAL_GetTick();
+  if ((int32_t)(now - next_ping_ms) < 0) {
+    return; // not yet time
+  }
+  next_ping_ms = now + 1000u;
+
+  if (flip == 0)
+  {
+    gw_ping_res_t r = gateway_send_ping_wait_pong();
+    if (r.rc == 0) consec_fail = 0;
+    else consec_fail++;
+
+    gw_handle_ping_result(&s, &r);
+    gw_maybe_print_stats(&s, 60u);
+  }
+  else
+  {
+    gw_temps_res_t tr = gateway_send_gtmp_wait_tmp();
+    if (tr.rc == 0) {
+      consec_fail = 0;
+      uart_printf("ADC0=%u ADC1=%u  T0=%ld mC  T1=%ld mC age=%u flags=0x%04X\r\n",
+                  (unsigned)tr.a0, (unsigned)tr.a1,
+                  (long)tr.t0_mC, (long)tr.t1_mC,
+                  (unsigned)tr.age_ms, (unsigned)tr.flags);
+    } else {
+      consec_fail++;
+      uart_printf("GTMP FAIL rc=%d st=0x%02X obs=0x%02X rpd=%u\r\n",
+                  tr.rc, tr.st_tx, tr.observe_tx, tr.rpd);
+    }
+  }
+
+  flip ^= 1;
+
+  if (consec_fail >= 5u) {
+    uart_printf("NRF reinit after %lu fails\r\n", (unsigned long)consec_fail);
+    nrf_init_link_common();
+    consec_fail = 0;
+  }
+}
+
 static void host_cmd_poll_uart1(void)
 {
   static uint8_t ch;
@@ -630,6 +677,32 @@ static void host_cmd_poll_uart1(void)
       else if (strcmp(line, "UPTIME?") == 0)
       {
         uart_send_uptime(&huart1);
+      }
+      else if (strcmp(line, "RPING?") == 0)
+      {
+        // RF ping remote node
+        gw_ping_res_t r = gateway_send_ping_wait_pong();
+        if (r.rc == 0) {
+          uart_send_str(&huart1, "RPONG\n");
+        } else {
+          uart_printf("RPING FAIL rc=%d st=0x%02X obs=0x%02X rpd=%u\n",
+                      r.rc, r.st_tx, r.observe_tx, r.rpd);
+        }
+      }
+      else if (strcmp(line, "TEMP?") == 0)
+      {
+        // One-shot RF temperature fetch
+        gw_temps_res_t tr = gateway_send_gtmp_wait_tmp();
+        if (tr.rc == 0) {
+          // One-line, machine-friendly format
+          uart_printf("TEMP ADC0=%u ADC1=%u T0=%ld T1=%ld age=%u flags=0x%04X\n",
+                      (unsigned)tr.a0, (unsigned)tr.a1,
+                      (long)tr.t0_mC, (long)tr.t1_mC,
+                      (unsigned)tr.age_ms, (unsigned)tr.flags);
+        } else {
+          uart_printf("TEMP FAIL rc=%d st=0x%02X obs=0x%02X rpd=%u\n",
+                      tr.rc, tr.st_tx, tr.observe_tx, tr.rpd);
+        }
       }
       else
       {
@@ -704,50 +777,12 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  static gw_stats_t s = {0};
-	  static uint32_t next_ping_ms = 0;
-	  static uint32_t consec_fail = 0;
-
 	  // Always keep UART responsive
 	  host_cmd_poll_uart1();
 
-	  // Run RF requests once per second
-	  const uint32_t now = HAL_GetTick();
-	  if ((int32_t)(now - next_ping_ms) >= 0) {
-	    next_ping_ms = now + 1000u;
-
-	    static uint8_t flip = 0;
-	    if (flip == 0)
-	    {
-		    gw_ping_res_t r = gateway_send_ping_wait_pong();
-		    if (r.rc == 0) consec_fail = 0;
-		    else consec_fail++;
-
-		    gw_handle_ping_result(&s, &r);
-		    gw_maybe_print_stats(&s, 60u);
-	    } else {
-			gw_temps_res_t tr = gateway_send_gtmp_wait_tmp();
-			if (tr.rc == 0) {
-			  consec_fail = 0;
-			  uart_printf("ADC0=%u ADC1=%u  T0=%ld mC  T1=%ld mC age=%u flags=0x%04X\r\n",
-			              (unsigned)tr.a0, (unsigned)tr.a1,
-			              (long)tr.t0_mC, (long)tr.t1_mC,
-			              (unsigned)tr.age_ms, (unsigned)tr.flags);
-			} else {
-			  consec_fail++;
-			  uart_printf("GTMP FAIL rc=%d st=0x%02X obs=0x%02X rpd=%u\r\n",
-			              tr.rc, tr.st_tx, tr.observe_tx, tr.rpd);
-			}
-	    }
-	    flip ^= 1;
-
-	    if (consec_fail >= 5) {
-	      uart_printf("NRF reinit after %lu fails\r\n", (unsigned long)consec_fail);
-	      nrf_init_link_common();
-	      consec_fail = 0;
-	    }
-
-	  }
+	  #if 0
+	  gateway_periodic_rf_task();
+	  #endif
 
 	  // Optional: tiny sleep to reduce CPU burn (still responsive)
 	  // HAL_Delay(1);
