@@ -36,7 +36,7 @@ The broader system documentation is maintained separately in:
 Related repositories:
 
 - **uartctl** (host-side Python CLI tool): `https://github.com/honkajan/uartctl`
-- **remote-fw** (remote node firmware): _to be published_
+- **remote-fw** (remote node firmware): `https://github.com/honkajan/remote-fw`
 
 ## Project layout
 
@@ -96,4 +96,4 @@ For system-level architecture, protocol documentation, and diagrams, see the mai
 
 ## License
 
-See the repository license file if present.
+See the repository license file.
